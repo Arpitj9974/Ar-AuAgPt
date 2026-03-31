@@ -7,11 +7,37 @@ This guide will teach you how to deploy the BullionLive application. Because the
 
 ---
 
-## Strategy 1: Unified Deployment (Render Only) - Recommended
+## Strategy 1: Unified Deployment on Railway (Highly Recommended - No Cold Starts)
 
-This is the fastest, easiest way to get the project live. You configure your Express backend to serve the compiled frontend, so you only have to host one server.
+Railway is exceptionally fast, beautiful, and its free/hobby tier does not sleep (no 30-second cold starts when opening the site). 
 
-### 1. Make the Backend Serve the Frontend
+Since your app is completely unified (the backend serves the frontend automatically), deploying to Railway takes just 3 clicks.
+
+### 1. Preparation (Already Done!)
+Your `server.ts` and `package.json` are already perfectly configured for Railway:
+* `npm run build` automatically builds the React frontend.
+* `npm run start` automatically runs `server.ts`, which serves both your API and your React UI!
+
+### 2. Deploy your app
+1. Make sure your latest code is pushed to **GitHub**.
+2. Go to **[Railway.app](https://railway.app/)** and sign in with your GitHub account.
+3. On your dashboard, click **"New Project"**.
+4. Select **"Deploy from GitHub repo"**.
+5. Select your `AR-AuAgPt` repository.
+6. Click **Deploy Now**.
+
+*(That's literally it!)*
+
+### 3. Generate a Public Domain
+Railway will build the app and start it in under a minute. 
+1. Once deployed, click on your project, go to the **Settings** tab.
+2. Scroll down to **Networking**.
+3. Under **Public Networking**, click **"Generate Domain"**.
+4. Railway will create a free `https://your-app.up.railway.app` link that you can share with your friends and teacher. It will load instantly!
+
+---
+
+## Strategy 2: Unified Deployment (Render)
 Update `server.ts` to host your built Vite files. Add this snippet right before `app.listen(port, ...)`:
 
 ```typescript
