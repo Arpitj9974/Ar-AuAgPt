@@ -25,10 +25,12 @@ export interface MarketData {
 const CACHE_KEY = 'ar_market_cache_v2'; // Changed version to force cache bypass
 const CACHE_MAX_AGE_MS = 5 * 60 * 1000; 
 
-// India effective duty multipliers (Precision tuned to match IBJA/GoodReturns Retail Benchmark)
-const INDIA_GOLD_DUTY   = 1.0705; // Matches ~₹1,47,300 at $4500 spot
-const INDIA_SILVER_DUTY = 1.0727; // Matches ~₹2,28,300 at $69 spot
-const INDIA_PLAT_DUTY   = 0.9995; // Matches ~₹56,900 at $1880 spot
+// India effective duty multipliers (Calibrated 2026-03-31 against IBJA/GoodReturns benchmarks)
+// These account for: Import Duty (6%) + AIDC (1%) + GST (3%) + spot-vs-futures offset
+// Verified against: Swissquote XAU/XAG/XPT spot + real Indian retail prices
+const INDIA_GOLD_DUTY   = 1.0628; // Verified: ₹1,49,250/10g at XAU $4667, INR 93.6
+const INDIA_SILVER_DUTY = 1.0759; // Verified: ₹2,42,400/kg at XAG $74.86, INR 93.6
+const INDIA_PLAT_DUTY   = 0.9748; // Verified: ₹57,715/10g at XPT $1968, INR 93.6
 
 function processMetal(usdPrice: number, changePercent: number, rate: number, metalType: 'gold' | 'silver' | 'platinum'): MetalPrice {
   let inrPrice: number;

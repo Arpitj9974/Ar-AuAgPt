@@ -16,6 +16,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'dist')));
 
+import YahooFinance from 'yahoo-finance2';
+const yahooFinance = new YahooFinance();
+
 // ── In-Memory Cache ────────────────────────────────────────────────────────────
 interface CachedMarketData {
   gold_usd: number;
@@ -27,72 +30,82 @@ interface CachedMarketData {
   platinum_change_percent: number;
   usd_inr_change_percent: number;
   cachedAt: number; // timestamp ms
+  source?: string;  // "swissquote" or "yahoo"
 }
 
 const CACHE_TTL_MS = 60_000; // refresh every 60 seconds
-const FETCH_TIMEOUT_MS = 8_000;
 
 let cache: CachedMarketData | null = null;
 let cacheRefreshing = false;
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
-async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+// ── Swissquote Spot Price Fetcher (Institutional-grade, free, no API key) ─────
+// Returns the TRUE global spot mid-price (bid+ask)/2 — NOT futures with premium
+async function fetchSwissquoteSpot(instrument: string): Promise<number | null> {
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const url = `https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/${instrument}/USD`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timer);
-    return res;
-  } catch (e) {
-    clearTimeout(timer);
-    throw e;
+    const data = await res.json() as any[];
+    if (Array.isArray(data) && data.length > 0) {
+      const prices = data[0]?.spreadProfilePrices?.[0];
+      if (prices && prices.bid && prices.ask) {
+        return (prices.bid + prices.ask) / 2; // true spot mid-price
+      }
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
-// ── Core Data Fetcher ──────────────────────────────────────────────────────────
+// ── Core Data Fetcher (Multi-Source: Swissquote PRIMARY → Yahoo FALLBACK) ─────
 async function fetchLiveMarketData(): Promise<CachedMarketData> {
   console.log('[Cache] Fetching fresh market data...');
 
-  // 1. Binance: PAXG/USDT ≈ Gold spot in USD
-  const paxgPromise = fetchWithTimeout('https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT', {}, 6000)
-    .then(r => r.json())
-    .catch(() => null);
-
-  // 2. USD → INR exchange rate
-  const exchangePromise = fetchWithTimeout('https://open.er-api.com/v6/latest/USD', {}, 6000)
-    .then(r => r.json())
-    .catch(() => null);
-
-  // 3. Yahoo Finance for Silver & Platinum (parallel with above)
-  const fetchYahoo = async (symbol: string) => {
-    try {
-      const r = await fetchWithTimeout(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`, {}, 10000);
-      const d = await r.json();
-      const meta = d?.chart?.result?.[0]?.meta;
-      if (!meta) return null;
-      return { price: meta.regularMarketPrice, prevClose: meta.chartPreviousClose };
-    } catch {
-      return null;
-    }
-  };
-
-  const [paxg, exchange, ag, pt] = await Promise.all([
-    paxgPromise,
-    exchangePromise,
-    fetchYahoo('SI=F'),
-    fetchYahoo('PL=F'),
+  // Fetch from BOTH sources in parallel for maximum reliability
+  const [xauSpot, xagSpot, xptSpot, yahooMap] = await Promise.all([
+    fetchSwissquoteSpot('XAU'),
+    fetchSwissquoteSpot('XAG'),
+    fetchSwissquoteSpot('XPT'),
+    (async () => {
+      try {
+        const results: any[] = (await yahooFinance.quote(['GC=F', 'SI=F', 'PL=F', 'INR=X'])) as any[];
+        const map: Record<string, any> = {};
+        for (const r of results) map[r.symbol] = r;
+        return map;
+      } catch (e: any) {
+        console.warn('[Cache] Yahoo Finance error:', e.message);
+        return {} as Record<string, any>;
+      }
+    })(),
   ]);
 
-  const gold_usd = paxg?.lastPrice ? parseFloat(paxg.lastPrice) : (cache?.gold_usd ?? 2680.00);
-  const gold_change_pct = paxg?.priceChangePercent ? parseFloat(paxg.priceChangePercent) : (cache?.gold_change_percent ?? 0.42);
-  const usd_inr = exchange?.rates?.INR ?? (cache?.usd_inr_rate ?? 84.83);
+  // ── Use Swissquote SPOT as PRIMARY, Yahoo FUTURES as FALLBACK ──
+  const gold_usd = xauSpot ?? yahooMap['GC=F']?.regularMarketPrice ?? cache?.gold_usd ?? 3100;
+  const silver_usd = xagSpot ?? yahooMap['SI=F']?.regularMarketPrice ?? cache?.silver_usd ?? 34;
+  const platinum_usd = xptSpot ?? yahooMap['PL=F']?.regularMarketPrice ?? cache?.platinum_usd ?? 1000;
 
-  const silver_usd = ag?.price ?? (cache?.silver_usd ?? 32.00);
-  const silver_change_pct = ag ? ((ag.price - ag.prevClose) / ag.prevClose) * 100 : (cache?.silver_change_percent ?? -0.18);
-  const platinum_usd = pt?.price ?? (cache?.platinum_usd ?? 970.00);
-  const platinum_change_pct = pt ? ((pt.price - pt.prevClose) / pt.prevClose) * 100 : (cache?.platinum_change_percent ?? 0.31);
+  // USD/INR: Yahoo Finance only (Swissquote free feed doesn't cover INR)
+  const usd_inr = yahooMap['INR=X']?.regularMarketPrice ?? cache?.usd_inr_rate ?? 85;
 
-  console.log(`[Cache] Data ready — Gold: $${gold_usd.toFixed(2)}, Silver: $${silver_usd.toFixed(2)}, Pt: $${platinum_usd.toFixed(2)}, USD/INR: ₹${usd_inr.toFixed(2)}`);
+  // ── % changes always from Yahoo (Swissquote doesn't provide previous close) ──
+  const computePercent = (sym: string, fallback: number) => {
+    const q = yahooMap[sym];
+    if (q?.regularMarketPrice && q?.regularMarketPreviousClose) {
+      return ((q.regularMarketPrice - q.regularMarketPreviousClose) / q.regularMarketPreviousClose) * 100;
+    }
+    return fallback;
+  };
+
+  const gold_change_pct = computePercent('GC=F', cache?.gold_change_percent ?? 0);
+  const silver_change_pct = computePercent('SI=F', cache?.silver_change_percent ?? 0);
+  const platinum_change_pct = computePercent('PL=F', cache?.platinum_change_percent ?? 0);
+  const usd_inr_change_pct = computePercent('INR=X', cache?.usd_inr_change_percent ?? 0);
+
+  const source = xauSpot ? 'Swissquote Spot' : 'Yahoo Futures';
+  console.log(`[Cache] [${source}] Gold: $${gold_usd.toFixed(2)}, Silver: $${silver_usd.toFixed(2)}, Pt: $${platinum_usd.toFixed(2)}, USD/INR: ₹${usd_inr.toFixed(2)}`);
 
   return {
     gold_usd,
@@ -102,8 +115,9 @@ async function fetchLiveMarketData(): Promise<CachedMarketData> {
     gold_change_percent: gold_change_pct,
     silver_change_percent: silver_change_pct,
     platinum_change_percent: platinum_change_pct,
-    usd_inr_change_percent: 0.05,
+    usd_inr_change_percent: usd_inr_change_pct,
     cachedAt: Date.now(),
+    source,
   };
 }
 
@@ -122,16 +136,11 @@ async function refreshCache() {
   }
 }
 
-// ── Cache Refresh Logic ────────────────────────────────────────────────────────
-
 // ── Server Startup Warm-up ─────────────────────────────────────────────────────
 async function startupWarmup() {
   console.log('[Server] 🚀 Starting warm-up...');
-  // Pre-warm the market data cache
   await refreshCache();
   console.log('[Server] ✅ Warm-up complete. Market data ready.');
-
-  // Schedule background cache refresh every 60 seconds
   setInterval(refreshCache, CACHE_TTL_MS);
 }
 
@@ -140,24 +149,21 @@ async function startupWarmup() {
 // GET /api/market-prices — returns cached data instantly
 app.get('/api/market-prices', (_req, res) => {
   if (cache) {
-    // Return cached data immediately — blazing fast
     const ageSeconds = Math.round((Date.now() - cache.cachedAt) / 1000);
     return res.json({ ...cache, dataAgeSeconds: ageSeconds });
   }
 
   // Fallback if cache isn't ready yet (should rarely happen after warmup)
-  // These are "Safe Fallback" prices to give the UI something realistic 
-  // while the very first fetch finishes in the background.
   return res.json({
-    gold_usd: 2684.50, 
-    silver_usd: 31.95, 
-    platinum_usd: 972.10,
-    usd_inr_rate: 84.85, 
+    gold_usd: 3100.00,
+    silver_usd: 34.00,
+    platinum_usd: 1000.00,
+    usd_inr_rate: 85.00,
     gold_change_percent: 0.15,
-    silver_change_percent: -0.10, 
+    silver_change_percent: -0.10,
     platinum_change_percent: 0.25,
-    usd_inr_change_percent: 0.05, 
-    cachedAt: Date.now(), 
+    usd_inr_change_percent: 0.05,
+    cachedAt: Date.now(),
     dataAgeSeconds: -1,
     error: 'Market data is warming up...'
   });
@@ -170,6 +176,5 @@ app.get('*', (req, res) => {
 
 app.listen(port, () => {
   console.log(`[Server] Running on http://localhost:${port}`);
-  // NON-BLOCKING warmup: Start fetching prices immediately without stopping the server
   startupWarmup();
 });
